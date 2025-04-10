@@ -770,6 +770,88 @@ namespace SPC
         }
 
         /// <summary>
+        /// Gets the paths to the most recently compiled .dll and .pdb files for this project
+        /// </summary>
+        /// <returns>An array of paths to the .dll and .pdb files, or an empty array if no compiled files are found</returns>
+        public string[] GetCompiled()
+        {
+            // Determine assembly name (use AssemblyName property if set, otherwise derive from project file name)
+            string assemblyName = _properties.ContainsKey("AssemblyName")
+                ? _properties["AssemblyName"]
+                : Path.GetFileNameWithoutExtension(_projectPath);
+
+            // Get the directory of the project file
+            string projectDir = Path.GetDirectoryName(_projectPath) ?? string.Empty;
+
+            // Define possible build output directories
+            List<string> possibleOutputDirs = new List<string>();
+
+            // Add standard output directories
+            possibleOutputDirs.Add(Path.Combine(projectDir, "bin", "Debug"));
+            possibleOutputDirs.Add(Path.Combine(projectDir, "bin", "Release"));
+
+            // Also look for target framework-specific directories
+            if (_properties.TryGetValue("TargetFramework", out string targetFramework) &&
+                !string.IsNullOrEmpty(targetFramework))
+            {
+                possibleOutputDirs.Add(Path.Combine(projectDir, "bin", "Debug", targetFramework));
+                possibleOutputDirs.Add(Path.Combine(projectDir, "bin", "Release", targetFramework));
+            }
+
+            // Look for multiple frameworks
+            if (_properties.TryGetValue("TargetFrameworks", out string targetFrameworks) &&
+                !string.IsNullOrEmpty(targetFrameworks))
+            {
+                var frameworks = targetFrameworks.Split(';');
+                foreach (var framework in frameworks)
+                {
+                    possibleOutputDirs.Add(Path.Combine(projectDir, "bin", "Debug", framework));
+                    possibleOutputDirs.Add(Path.Combine(projectDir, "bin", "Release", framework));
+                }
+            }
+
+            // Find the directory with the most recent compilation
+            string mostRecentDir = null;
+            DateTime mostRecentTime = DateTime.MinValue;
+
+            foreach (var dir in possibleOutputDirs)
+            {
+                if (!Directory.Exists(dir))
+                    continue;
+
+                string dllPath = Path.Combine(dir, $"{assemblyName}.dll");
+                if (File.Exists(dllPath))
+                {
+                    DateTime lastWriteTime = File.GetLastWriteTime(dllPath);
+                    if (lastWriteTime > mostRecentTime)
+                    {
+                        mostRecentDir = dir;
+                        mostRecentTime = lastWriteTime;
+                    }
+                }
+            }
+
+            // If no directory with a .dll file was found, return empty array
+            if (mostRecentDir == null)
+            {
+                return Array.Empty<string>();
+            }
+
+            // Return the paths to the .dll and .pdb files if they exist
+            string dllFilePath = Path.Combine(mostRecentDir, $"{assemblyName}.dll");
+            string pdbFilePath = Path.Combine(mostRecentDir, $"{assemblyName}.pdb");
+
+            List<string> result = new List<string> { dllFilePath };
+
+            if (File.Exists(pdbFilePath))
+            {
+                result.Add(pdbFilePath);
+            }
+
+            return result.ToArray();
+        }
+
+        /// <summary>
         /// Creates a new ASP.NET Core Web API project
         /// </summary>
         /// <param name="projectPath">The path where the project file will be saved</param>

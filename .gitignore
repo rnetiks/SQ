@@ -1,0 +1,6 @@
+/SQ/bin/*
+/SQ/obj/*
+/SPC/obj/*
+/SPC/bin/*
+/.idea/*
+Test.sln.DotSettings.user

@@ -384,6 +384,8 @@ partial class Program
 
 
         var outputDirs = await GetOutputDirectoriesAsync(projectDir);
+        // TODO Search for direct files and use outputDirs as the new folder name in the zipped file
+
         if (outputDirs.Count == 0)
         {
             throw new InvalidOperationException("No output directories found. Build the project first.");
@@ -421,17 +423,15 @@ partial class Program
             }));
 
 
-            var options = new ParallelOptions { MaxDegreeOfParallelism = Math.Min(4, Environment.ProcessorCount) };
-            await Parallel.ForEachAsync(filesToProcess, options, async (fileInfo, token) =>
+            foreach (var (filePath, entryName) in filesToProcess)
             {
-                var (filePath, entryName) = fileInfo;
                 var entry = archive.CreateEntry(entryName, CompressionLevel.Optimal);
-
+    
                 using var sourceStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read,
                     BufferSize, true);
                 using var targetStream = entry.Open();
-                await sourceStream.CopyToAsync(targetStream, BufferSize, token);
-            });
+                await sourceStream.CopyToAsync(targetStream, BufferSize);
+            }
         }
     }
 
