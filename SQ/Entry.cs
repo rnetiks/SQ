@@ -6,6 +6,7 @@ using System.IO.Compression;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Security.Principal;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -25,8 +26,8 @@ partial class Program
         },
         { "new", CreateProjectAsync },
         { "release", async args => await ZipProjectAsync(args) },
-        { "link", async _ => await LinkProjectAsync() },
-        { "unlink", async _ => await UnlinkProjectAsync() }
+        { "link", async args => await LinkProjectAsync(args) },
+        { "unlink", async args => await UnlinkProjectAsync(args) }
     };
 
 
@@ -334,15 +335,16 @@ partial class Program
     {
         try
         {
-            string currentDir = Environment.CurrentDirectory;
-            string projectName;
-            projectName = args.Length > 1 ? args[1] : Path.GetFileName(currentDir);
+            string dirPath = args.Length > 1
+                ? Path.Combine(Environment.CurrentDirectory, args[1])
+                : Environment.CurrentDirectory;
+            var projectName = Path.GetFileName(dirPath);
 
 
             string outputPath = GetConfigValue(CONFIG_OUTPUT_PATH);
             if (string.IsNullOrEmpty(outputPath))
             {
-                outputPath = currentDir;
+                outputPath = Environment.CurrentDirectory;
             }
 
 
@@ -356,16 +358,15 @@ partial class Program
 
 
             Console.WriteLine($"Creating zip file: {zipFilePath}");
-            await CreateZipFromProjectAsync(currentDir, zipFilePath);
 
-
-            string outputMethod = GetConfigValue(CONFIG_OUTPUT_METHOD);
+            await CreateZipFromProjectAsync(dirPath, zipFilePath);
+            /*string outputMethod = GetConfigValue(CONFIG_OUTPUT_METHOD);
             if (outputMethod == "scp")
             {
                 await UploadViaScpAsync(zipFilePath);
             }
 
-            Console.WriteLine("Release completed successfully.");
+            Console.WriteLine("Release completed successfully.");*/
             return 0;
         }
         catch (Exception ex)
@@ -375,6 +376,7 @@ partial class Program
         }
     }
 
+    /// <param name="projectDir">The path of where to look at</param>
     private static async Task CreateZipFromProjectAsync(string projectDir, string zipFilePath)
     {
         if (File.Exists(zipFilePath))
@@ -382,8 +384,14 @@ partial class Program
             File.Delete(zipFilePath);
         }
 
+        var projects = Directory.GetFiles(projectDir, "*.csproj", SearchOption.AllDirectories);
+        List<string> outputDirs = [];
+        foreach (var project in projects)
+        {
+            var load = ProjectFileGenerator.Load(project);
+            outputDirs.AddRange(load.GetCompiled());
+        }
 
-        var outputDirs = await GetOutputDirectoriesAsync(projectDir);
         // TODO Search for direct files and use outputDirs as the new folder name in the zipped file
 
         if (outputDirs.Count == 0)
@@ -396,38 +404,21 @@ partial class Program
                    BufferSize, FileOptions.Asynchronous))
         using (var archive = new ZipArchive(zipStream, ZipArchiveMode.Create))
         {
-            var filesToProcess = new ConcurrentBag<(string FilePath, string EntryName)>();
+            var folder = outputDirs.Select(e => e.Replace(projectDir, string.Empty)).ToArray();
 
 
-            await Task.WhenAll(outputDirs.Select(async outputDir =>
+            for (var index = 0; index < outputDirs.Count; index++)
             {
-                if (!Directory.Exists(outputDir))
-                    return;
-
-
-                var dllFiles = Directory.GetFiles(outputDir, "*.dll");
-                var pdbFiles = Directory.GetFiles(outputDir, "*.pdb");
-
-                foreach (var file in dllFiles.Concat(pdbFiles))
+                if (folder[index].StartsWith('\\'))
                 {
-                    string fileName = Path.GetFileName(file);
-                    if (SystemLibraryRegex.IsMatch(fileName))
-                        continue;
-
-                    string entryName = Path.Combine(
-                        Path.GetFileName(Path.GetDirectoryName(outputDir)),
-                        fileName);
-
-                    filesToProcess.Add((file, entryName));
+                    folder[index] = folder[index].Substring(1);
                 }
-            }));
+
+                var entry = archive.CreateEntry(folder[index], CompressionLevel.Optimal);
 
 
-            foreach (var (filePath, entryName) in filesToProcess)
-            {
-                var entry = archive.CreateEntry(entryName, CompressionLevel.Optimal);
-    
-                using var sourceStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                using var sourceStream = new FileStream(outputDirs[index], FileMode.Open, FileAccess.Read,
+                    FileShare.Read,
                     BufferSize, true);
                 using var targetStream = entry.Open();
                 await sourceStream.CopyToAsync(targetStream, BufferSize);
@@ -467,7 +458,7 @@ partial class Program
             long bytesRead = 0;
             var buffer = new byte[BufferSize];
             int read;
-            
+
             // TODO
         }
         catch (Exception ex)
@@ -476,8 +467,14 @@ partial class Program
         }
     }
 
-    private static async Task<int> LinkProjectAsync()
+    private static async Task<int> LinkProjectAsync(string[] args)
     {
+        if (!IsAdministrator())
+        {
+            Console.WriteLine("Administrator privileges are required to run the linking utility.");
+            return -1;
+        }
+
         try
         {
             string targetDir = GetConfigValue(CONFIG_LINK_TARGET);
@@ -492,10 +489,18 @@ partial class Program
                 Directory.CreateDirectory(targetDir);
             }
 
-            string projectDir = Environment.CurrentDirectory;
+            ;
+            string projectDir = args.Length > 1
+                ? Path.Combine(Environment.CurrentDirectory, args[1])
+                : Environment.CurrentDirectory;
 
 
-            var outputDirs = await GetOutputDirectoriesAsync(projectDir);
+            var outputDirs = new List<string>();
+            foreach (var file in Directory.GetFiles(projectDir, "*.csproj", SearchOption.AllDirectories))
+            {
+                var load = ProjectFileGenerator.Load(file);
+                outputDirs.AddRange(load.GetCompiled());
+            }
 
             if (outputDirs.Count == 0)
             {
@@ -503,73 +508,33 @@ partial class Program
                 return 1;
             }
 
-
-            var results = new ConcurrentBag<(bool Success, string Message, string SourceFile, string SymlinkPath)>();
-
-            await Parallel.ForEachAsync(outputDirs,
-                new ParallelOptions { MaxDegreeOfParallelism = MaxDegreeOfParallelism },
-                async (outputDir, token) =>
-                {
-                    if (!Directory.Exists(outputDir))
-                        return;
-
-
-                    try
-                    {
-                        var symbolic = new Symbolic(outputDir, targetDir, includeSubfolders: false);
-                        symbolic.IncludePattern($"{Path.GetFileName(projectDir)}*.dll");
-
-                        var result = symbolic.Execute();
-                        if (result.Success)
-                        {
-                            results.Add((true, "Link created successfully", result.SourceFile, result.SymlinkPath));
-
-                            if (result.PdbIncluded)
-                            {
-                                results.Add((true, "PDB link created successfully", result.PdbSourceFile,
-                                    result.PdbSymlinkPath));
-                            }
-                        }
-                        else
-                        {
-                            results.Add((false, $"Failed: {result.ErrorMessage}", null, null));
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        results.Add((false, $"Exception: {ex.Message}", null, null));
-                    }
-                });
-
-
-            int successCount = 0;
-            int failCount = 0;
-
-            foreach (var (success, message, sourceFile, symlinkPath) in results)
+            foreach (var file in outputDirs)
             {
-                if (success)
-                {
-                    Console.WriteLine($"Created link: {sourceFile} -> {symlinkPath}");
-                    successCount++;
-                }
-                else
-                {
-                    Console.WriteLine($"Error: {message}");
-                    failCount++;
-                }
-            }
+                var path = Path.Combine(targetDir, Path.GetFileName(file));
+                if (File.Exists(path))
+                    File.Delete(path);
 
-            Console.WriteLine($"Linking completed. Created {successCount} links, failed {failCount}.");
-            return failCount > 0 ? 1 : 0;
+                File.CreateSymbolicLink(path, file);
+                Console.WriteLine($"F:{Path.GetFileName(file)} => SL:{Path.GetFileName(path)}");
+            }
         }
         catch (Exception ex)
         {
             Console.WriteLine($"Error creating links: {ex.Message}");
             return 1;
         }
+
+        return 0;
     }
 
-    private static async Task<int> UnlinkProjectAsync()
+    private static bool IsAdministrator()
+    {
+        WindowsIdentity identity = WindowsIdentity.GetCurrent();
+        WindowsPrincipal principal = new WindowsPrincipal(identity);
+        return principal.IsInRole(WindowsBuiltInRole.Administrator);
+    }
+
+    private static async Task<int> UnlinkProjectAsync(string[] args)
     {
         try
         {
@@ -580,40 +545,28 @@ partial class Program
                 return 1;
             }
 
-            string projectDir = Environment.CurrentDirectory;
-            string projectName = Path.GetFileName(projectDir);
+            string projectDir = args.Length > 1
+                ? Path.Combine(Environment.CurrentDirectory, args[1])
+                : Environment.CurrentDirectory;
 
-
-            var files = Directory.GetFiles(targetDir);
-            int removedCount = 0;
-            int failedCount = 0;
-
-
-            await Parallel.ForEachAsync(files, new ParallelOptions { MaxDegreeOfParallelism = MaxDegreeOfParallelism },
-                async (file, token) =>
+            List<string> outputDirs = new List<string>();
+            foreach (var file in Directory.GetFiles(projectDir, "*.csproj", SearchOption.AllDirectories))
+            {
+                var load = ProjectFileGenerator.Load(file);
+                outputDirs.AddRange(load.GetCompiled());
+            }
+            
+            foreach (var dir in outputDirs)
+            {
+                var path = Path.Combine(targetDir, Path.GetFileName(dir));
+                if (File.Exists(path))
                 {
-                    if (!IsSymbolicLink(file))
-                        return;
+                    File.Delete(path);
+                    Console.WriteLine($"SL:{Path.GetFileName(path)} => /null/");
+                }
+            }
 
-
-                    string fileName = Path.GetFileName(file);
-                    if (fileName.StartsWith(projectName, StringComparison.OrdinalIgnoreCase))
-                    {
-                        try
-                        {
-                            File.Delete(file);
-                            Interlocked.Increment(ref removedCount);
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"Failed to remove link {file}: {ex.Message}");
-                            Interlocked.Increment(ref failedCount);
-                        }
-                    }
-                });
-
-            Console.WriteLine($"Unlinking completed. Removed {removedCount} links, failed to remove {failedCount}.");
-            return failedCount > 0 ? 1 : 0;
+            return 0;
         }
         catch (Exception ex)
         {
